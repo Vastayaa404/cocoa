@@ -10,6 +10,7 @@ const corsConfig = {
 
 const headersConfig = (req, res, next) => {
   req.headers['X-Cocoa-Request-Id'] = uuidv4();
+  req.headers['Ray-Id'] = uuidv4();
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
   next();
 };
