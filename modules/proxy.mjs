@@ -70,6 +70,7 @@ if (cluster.isPrimary) {
         
         req.headers['x-forwarded-for'] = '127.0.0.100:4000'; // Сами проксируем, ну а хуле
         // Проксируем запрос на бэкенд
+        if (!req.body) return res.status(400).send('Nullish request')
         const response = await axios[req.method.toLowerCase()](`http://${backendIP}:5000${req.url}`, req.body, { headers: { 'x-forwarded-for': req.headers['x-forwarded-for'], 'x-session-id': req.headers['x-session-id'], 'x-service': clientType } })
         const selectedHeaders = ['x-dora-request-id']; // То что надо оставить с бэка
         selectedHeaders.forEach(header => response.headers[header] && res.header(header, response.headers[header]));
