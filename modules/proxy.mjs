@@ -19,7 +19,7 @@ if (cluster.isPrimary) {
   const generateRayId = () => crypto.randomBytes(16).toString('hex'); // 32-символьный идентификатор
   const generateSessionID = () => crypto.randomBytes(16).toString('hex'); // Идентификатор сессии
   const verifyApiKey = (apiKey) => validApiKeys.includes(apiKey); // Пример проверки API-ключа
-  const selectBackend = (clientType) => { if (clientType === 'frontend') return allowedIPs[4]; if (clientType === 'backend') return 'BACKEND_IP_2'; console.log('Для клиента нет необходимого сервера'); return null }; // Пример функции выбора бэкенда
+  const selectBackend = (clientType) => { if (clientType === 'frontend') return allowedIPs[4]; if (clientType === 'backend') return allowedIPs[1]; console.log('Для клиента нет необходимого сервера'); return null }; // Пример функции выбора бэкенда
 
   const fastify = Fastify()
   fastify.addHook('onRequest', headersConfig).register(cors, corsConfig)
@@ -32,9 +32,9 @@ if (cluster.isPrimary) {
     res.header("c-ray", req.headers['Ray-id']);
 
     const clientIP = req.socket.remoteAddress;
+
     if (req.headers['x-forwarded-for']) return res.status(406).send('Proxying is not allowed. Dirty Query'); // Если новый клиент проксирован, то кто он?
     if (!allowedIPs.includes(clientIP)) return res.status(407).send({ error: 'Unable to load site' });
-    
     if (!req.body || !req.body.clientType || !req.body.apiKey) return res.status(428).send({ error: 'Unable to load resource' });
     const { clientType, apiKey } = req.body;  // clientType может быть "frontend" или "backend"
     
@@ -75,10 +75,6 @@ if (cluster.isPrimary) {
         const selectedHeaders = ['x-dora-request-id']; // То что надо оставить с бэка
         selectedHeaders.forEach(header => response.headers[header] && res.header(header, response.headers[header]));
         res.send(response.data);
-      } catch (e) {
-        res.status(e.response?.status || 502).send({ error: e.response?.data || 'Bad Gateway' });
-      }
-    },
-  })
-  .listen({ port: 4000, host: '127.0.0.100' }, (err, address) => { if (err) throw err });
+      } catch (e) { res.status(e.response?.status || 502).send({ data: e.response?.data || 'Bad Gateway' }) }
+    }}).listen({ port: 4000, host: '127.0.0.100' }, (err, address) => { if (err) throw err });
 };
