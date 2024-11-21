@@ -12,6 +12,10 @@ const headersConfig = (req, res, next) => {
   req.headers['X-Cocoa-Request-Id'] = uuidv4();
   req.headers['Ray-Id'] = uuidv4();
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  res.header('strict-transport-security', 'max-age=31536000; includeSubDomains; preload');
+  res.header('x-content-type-options', 'nosniff');
+  res.header('x-frame-options', 'DENY');
+  res.header('x-xss-protection', '1; mode=block');
   next();
 };
 
