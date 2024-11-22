@@ -1,7 +1,7 @@
 // Import all dependencies ======================================================================================================================================================================================================>
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import limit from '@fastify/rate-limit';
+import cookie from '@fastify/cookie';
 import crypto from 'crypto';
 import cluster from 'cluster';
 import { cpus } from 'os';
@@ -21,45 +21,59 @@ if (cluster.isPrimary) {
   const privateKey = fs.readFileSync('../keys/ec_private.key', 'utf8');
   const publicKey = fs.readFileSync('../keys/ec_public.key', 'utf8');
 
-  const CONFIG = { allowedIPs: ['FRONTEND', '127.0.0.1', 'BACKEND', 'BACKEND_IP_2', '127.0.0.10'], validApiKeys: ['API_KEY_FOR_FRONT', 'API_KEY_FOR_BACK'], };
+  const CONFIG = { allowedIPs: ['FRONTEND', '127.0.0.1', 'BACKEND', 'BACKEND_IP_2', '127.0.0.10'], validApiKeys: ['API_KEY_FOR_FRONT', 'API_KEY_FOR_BACK'] };
 
   const generateId = (size) => crypto.randomBytes(size).toString('hex');
   const verifyApiKey = (apiKey) => CONFIG.validApiKeys.includes(apiKey);
-  const selectBackend = (clientType) => ({ frontend: CONFIG.allowedIPs[4], backend: CONFIG.allowedIPs[1], }[clientType] || null);
-  const generateToken = (payload) => jwt.sign(payload, privateKey, { algorithm: 'ES384', expiresIn: '24h', issuer: 'Cocoa' });
+  const selectBackend = (clientType) => ({ frontend: CONFIG.allowedIPs[4], backend: CONFIG.allowedIPs[1] }[clientType] || null);
+  const generateToken = (payload) => jwt.sign(payload, privateKey, { algorithm: 'ES384', expiresIn: '24h', issuer: 'Cocoa', });
   const verifyToken = (token) => jwt.verify(token, publicKey, { algorithms: ['ES384'], issuer: 'Cocoa' });
 
-  const validateClient = (req, res) => {
-    const clientIP = req.socket.remoteAddress;
-    if (!CONFIG.allowedIPs.includes(clientIP)) return res.status(407).send({ error: 'Unable to load site' });
-    if (req.headers['x-forwarded-for']) return res.status(406).send('Proxying is not allowed');
+  const generateFingerprint = (req) => {
+    const hash = crypto.createHash('sha256');
+    hash.update(req.headers['user-agent'] || '');
+    hash.update(req.headers['accept-encoding'] || '');
+    hash.update(req.headers['accept-language'] || '');
+    return hash.digest('hex');
   };
 
-  Fastify().register(cors, corsConfig).register(limit, { hook: 'preHandler', max: 30, timeWindow: '1 minute', ban: 2 }).addHook('onRequest', headersConfig)
-  .post('/a', async (req, res) => {
-    try {
-      res.header('server', 'Cocoa');
+  const validateClient = (req, res) => { const clientIP = req.socket.remoteAddress;
+    if (!CONFIG.allowedIPs.includes(clientIP)) { return res.status(407).send({ error: 'Unable to load site' }) };
+    if (req.headers['x-forwarded-for']) { return res.status(406).send('Proxying is not allowed') };
+  };
+
+  Fastify().register(cors, corsConfig).register(cookie, { secret: "ZK9/AS,dsds]sdWQIKM-Sas", hook: 'onRequest' }).addHook('onRequest', headersConfig)
+    .addHook('onRequest', async (req, res) => {
       const rayId = req.headers['ray-id'] || generateId(8);
+      const requestCount = await redis.incr(`rate_limit:${rayId}`);
+      if (requestCount > 30) return res.status(429).send({ error: 'Too many requests' });
+      redis.expire(`rate_limit:${rayId}`, 60);
       res.header('c-ray', rayId);
+    })
+    .post('/a', async (req, res) => {
+      try {
+        res.header('server', 'Cocoa');
+        const rayId = req.headers['ray-id'] || generateId(8);
+        const fingerprint = generateFingerprint(req);
 
-      validateClient(req, res);
+        validateClient(req, res);
 
-      const { clientType, prjName, preValidation } = req.body || {};
-      if (!clientType || !prjName || !preValidation) return res.status(428).send({ error: 'Unable to load resource' });
-      if (!verifyApiKey(preValidation)) return res.status(422).send({ error: 'Unprocessible connection' });
+        const { clientType, prjName, preValidation } = req.body || {};
+        if (!clientType || !prjName || !preValidation) { return res.status(428).send({ error: 'Unable to load resource' }) };
+        if (!verifyApiKey(preValidation)) { return res.status(422).send({ error: 'Invalid API key' }) };
 
-      const backendIP = selectBackend(clientType);
-      if (!backendIP) return res.status(400).send({ error: 'Invalid clientType' });
+        const backendIP = selectBackend(clientType);
+        if (!backendIP) { return res.status(400).send({ error: 'Invalid client type' }) };
 
-      const sessionID = generateId(16);
-      const token = generateToken({ clientType, prjName });
+        const sessionID = generateId(16);
+        const token = generateToken({ clientType, prjName });
+        await redis.set(sessionID, JSON.stringify({ backendIP, clientType, token, rayId, fingerprint }));
 
-      await redis.set(sessionID, JSON.stringify({ backendIP, clientType, token }));
-      res.status(201).send({ sessionID, token });
-    } catch (err) { res.status(503).send({ error: 'Cocoa error' }) };
-  })
-  .route({
-    method: ['GET', 'POST'], url: '/*', handler: async (req, res) => {
+        res.setCookie('c_at', token, { httpOnly: true, secure: true, sameSite: 'Strict' });
+        res.status(201).send({ sessionID });
+      } catch (err) { res.status(503).send({ error: 'Cocoa error' }) };
+    })
+    .route({ method: ['GET', 'POST'], url: '/*', handler: async (req, res) => {
       try {
         res.header('server', 'Cocoa');
         const rayId = req.headers['ray-id'] || generateId(8);
@@ -67,28 +81,119 @@ if (cluster.isPrimary) {
 
         validateClient(req, res);
 
-        const token = req.headers['x-cat'];
-        if (!token) return res.status(422).send({ error: 'Unprocessible session' });
+        const token = req.cookies.c_at;
+        if (!token) { return res.status(422).send({ error: 'Missing auth token' }) };
 
-        try { verifyToken(token) } catch (err) { return res.status(401).send({ error: 'Invalid token' }) }
+        let decoded;
+        try { decoded = verifyToken(token) } catch (err) { return res.status(401).send({ error: 'Invalid token' }) };
 
         const sessionID = req.headers['x-session-id'];
-        const sessionData = await redis.get(sessionID);
-        if (!sessionData) return res.status(401).send({ error: 'Session not found' });
+        const sessionData = JSON.parse(await redis.get(sessionID));
+        if (!sessionData) { return res.status(401).send({ error: 'Session not found' }) };
 
-        const { backendIP, clientType } = JSON.parse(sessionData);
+        const { backendIP, rayId: storedRayId, fingerprint: storedFingerprint } = sessionData;
+        if (/*storedRayId !== rayId ||*/ storedFingerprint !== generateFingerprint(req)) { return res.status(403).send({ error: 'Session mismatch' }) };
+
         req.headers['x-forwarded-for'] = '127.0.0.100:4000';
 
-        const response = await axios[req.method.toLowerCase()](`http://${backendIP}:5000${req.url}`, req.body, { headers: { 'x-service': clientType } });
-
-        const selectedHeaders = ['x-dora-request-id']; // То что надо оставить с бэка
-        selectedHeaders.forEach(header => response.headers[header] && res.header(header, response.headers[header]));
+        const response = await axios[req.method.toLowerCase()](`http://${backendIP}:5000${req.url}`, req.body, { headers: { 'x-service': decoded.clientType } });
+        const selectedHeaders = ['x-dora-request-id'];
+        selectedHeaders.forEach((header) => response.headers[header] && res.header(header, response.headers[header]));
         res.send(response.data);
-      } catch (err) { res.status(err.response?.status || 502).send({ error: err.response?.data || 'Bad Gateway' }) }} }).listen({ port: 4000, host: '127.0.0.100' }, (err) => { if (err) throw err });
+      } catch (err) { res.status(err.response?.status || 502).send({ error: err.response?.data || 'Bad Gateway' }) } } 
+    }).listen({ port: 4000, host: '127.0.0.100' }, (err) => { if (err) throw err });
 
 
 
 
+
+
+
+
+  // v3
+
+
+
+
+
+  // const privateKey = fs.readFileSync('../keys/ec_private.key', 'utf8');
+  // const publicKey = fs.readFileSync('../keys/ec_public.key', 'utf8');
+
+  // const CONFIG = { allowedIPs: ['FRONTEND', '127.0.0.1', 'BACKEND', 'BACKEND_IP_2', '127.0.0.10'], validApiKeys: ['API_KEY_FOR_FRONT', 'API_KEY_FOR_BACK'], };
+
+  // const generateId = (size) => crypto.randomBytes(size).toString('hex');
+  // const verifyApiKey = (apiKey) => CONFIG.validApiKeys.includes(apiKey);
+  // const selectBackend = (clientType) => ({ frontend: CONFIG.allowedIPs[4], backend: CONFIG.allowedIPs[1], }[clientType] || null);
+  // const generateToken = (payload) => jwt.sign(payload, privateKey, { algorithm: 'ES384', expiresIn: '24h', issuer: 'Cocoa' });
+  // const verifyToken = (token) => jwt.verify(token, publicKey, { algorithms: ['ES384'], issuer: 'Cocoa' });
+
+  // const validateClient = (req, res) => {
+  //   const clientIP = req.socket.remoteAddress;
+  //   if (!CONFIG.allowedIPs.includes(clientIP)) return res.status(407).send({ error: 'Unable to load site' });
+  //   if (req.headers['x-forwarded-for']) return res.status(406).send('Proxying is not allowed');
+  // };
+
+  // Fastify().register(cors, corsConfig).register(limit, { hook: 'preHandler', max: 30, timeWindow: '1 minute', ban: 2 })c
+  // .post('/a', async (req, res) => {
+  //   try {
+  //     res.header('server', 'Cocoa');
+  //     const rayId = req.headers['ray-id'] || generateId(8);
+  //     res.header('c-ray', rayId);
+
+  //     validateClient(req, res);
+
+  //     const { clientType, prjName, preValidation } = req.body || {};
+  //     if (!clientType || !prjName || !preValidation) return res.status(428).send({ error: 'Unable to load resource' });
+  //     if (!verifyApiKey(preValidation)) return res.status(422).send({ error: 'Unprocessible connection' });
+
+  //     const backendIP = selectBackend(clientType);
+  //     if (!backendIP) return res.status(400).send({ error: 'Invalid clientType' });
+
+  //     const sessionID = generateId(16);
+  //     const token = generateToken({ clientType, prjName });
+
+  //     await redis.set(sessionID, JSON.stringify({ backendIP, clientType, token, rayId }));
+  //     res.status(201).send({ sessionID, token });
+  //   } catch (err) { res.status(503).send({ error: 'Cocoa error' }) };
+  // })
+  // .route({
+  //   method: ['GET', 'POST'], url: '/*', handler: async (req, res) => {
+  //     try {
+  //       res.header('server', 'Cocoa');
+  //       const rayId = req.headers['ray-id'] || generateId(8);
+  //       res.header('c-ray', rayId);
+
+  //       validateClient(req, res);
+
+  //       const token = req.headers['x-cat'];
+  //       if (!token) return res.status(422).send({ error: 'Unprocessible session' });
+
+  //       try { verifyToken(token) } catch (err) { return res.status(401).send({ error: 'Invalid token' }) }
+
+  //       const sessionID = req.headers['x-session-id'];
+  //       // const sessionData = await redis.get(sessionID);
+        
+
+  //       const sessionData = JSON.parse(await redis.get(sessionID));
+  //       console.log(sessionData);
+  //       if (sessionData.rayId !== req.headers['ray-id']) { return res.status(403).send({ error: 'Ray ID mismatch. Possible forgery detected.' }) };
+
+  //       if (!sessionData) return res.status(401).send({ error: 'Session not found' });
+
+  //       const { backendIP, clientType } = JSON.parse(sessionData);
+  //       req.headers['x-forwarded-for'] = '127.0.0.100:4000';
+
+  //       const response = await axios[req.method.toLowerCase()](`http://${backendIP}:5000${req.url}`, req.body, { headers: { 'x-service': clientType } });
+
+  //       const selectedHeaders = ['x-dora-request-id']; // То что надо оставить с бэка
+  //       selectedHeaders.forEach(header => response.headers[header] && res.header(header, response.headers[header]));
+  //       res.send(response.data);
+  //     } catch (err) { res.status(err.response?.status || 502).send({ error: err.response?.data || 'Bad Gateway' }) }} 
+  //   }).listen({ port: 4000, host: '127.0.0.100' }, (err) => { if (err) throw err });
+
+
+
+ // v 2
 
 
 
