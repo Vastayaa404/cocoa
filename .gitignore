@@ -9,6 +9,9 @@ lerna-debug.log*
 
 node_modules
 *.pem
+*.key
+*.crt
+*.csr
 *.local
 .env
 
